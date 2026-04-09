@@ -16,10 +16,13 @@ import sys
 from datetime import date
 from typing import Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import anthropic
 import pandas as pd
 
-from fetchers.usgs import fetch_flow, fetch_multiple_gauges, ARKANSAS_GAUGES
+from fetchers.usgs import fetch_flow, ARKANSAS_GAUGES
 from fetchers.snotel import fetch_snotel, ARKANSAS_SNOTEL_SITES
 from fetchers.noaa import fetch_forecast, fetch_historical_weather
 from models.predictor import FlowPredictor
@@ -43,7 +46,7 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": (
                         "8-digit USGS site number. Defaults to 07091200 "
-                        "(Arkansas River at Granite, CO). "
+                        "(Arkansas River near Nathrop, CO). "
                         "Available: " + ", ".join(f"{k} ({v})" for k, v in ARKANSAS_GAUGES.items())
                     ),
                     "default": "07091200",
@@ -64,8 +67,8 @@ TOOLS: list[dict] = [
     {
         "name": "fetch_snotel_snowpack",
         "description": (
-            "Fetch daily Snow Water Equivalent (SWE, inches) from NRCS "
-            "SNOTEL stations in the upper Arkansas River basin."
+            "Load daily Snow Water Equivalent (SWE, inches) from local NRCS "
+            "SNOTEL CSV files for stations in the upper Arkansas River basin."
         ),
         "input_schema": {
             "type": "object",
@@ -78,11 +81,6 @@ TOOLS: list[dict] = [
                 "end_date": {
                     "type": "string",
                     "description": "End date ISO-8601 (defaults to today).",
-                },
-                "element_cd": {
-                    "type": "string",
-                    "description": "AWDB element code: WTEQ (SWE), SNWD (depth), PRCPSA (accum. precip).",
-                    "default": "WTEQ",
                 },
             },
             "required": [],
@@ -198,22 +196,18 @@ def _tool_fetch_usgs_flow(site_no: str = "07091200",
 
 
 def _tool_fetch_snotel(start_date: str = "1990-01-01",
-                       end_date: str | None = None,
-                       element_cd: str = "WTEQ") -> str:
-    end = end_date or date.today().isoformat()
-    df = fetch_snotel(start_date=start_date, end_date=end, element_cd=element_cd)
+                       end_date: str | None = None) -> str:
+    df = fetch_snotel(start_date=start_date, end_date=end_date)
     latest = df.iloc[-1]
-    avg_col = f"{element_cd.lower()}_basin_avg"
     result = {
-        "element": element_cd,
         "date_range": f"{df.index.min().date()} to {df.index.max().date()}",
         "stations": list(ARKANSAS_SNOTEL_SITES.values()),
         "latest_date": str(df.index[-1].date()),
-        "latest_basin_avg": round(float(latest[avg_col]), 2) if avg_col in latest else None,
+        "latest_basin_avg_swe_in": round(float(latest["wteq_basin_avg"]), 2) if "wteq_basin_avg" in latest else None,
         "latest_by_station": {
             col: round(float(latest[col]), 2)
             for col in df.columns
-            if col != avg_col and not pd.isna(latest[col])
+            if col != "wteq_basin_avg" and not pd.isna(latest[col])
         },
     }
     return json.dumps(result, default=str)

@@ -18,7 +18,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -70,6 +70,12 @@ class FlowPredictor:
         # Merge SNOTEL data
         df = df.join(snotel_df, how="left")
 
+        # Forward-fill SNOTEL columns to cover sensor outages and trailing
+        # edge gaps where CSV data ends before the USGS record.  Limit to 14
+        # days so genuinely missing stations don't silently propagate further.
+        swe_raw_cols = [c for c in df.columns if c.startswith("wteq_") or c.startswith("swe_")]
+        df[swe_raw_cols] = df[swe_raw_cols].ffill(limit=14)
+
         # Merge weather if provided
         if weather_df is not None and not weather_df.empty:
             df = df.join(weather_df, how="left")
@@ -97,7 +103,7 @@ class FlowPredictor:
             .mean()
         )
 
-        df = df.dropna(subset=["target", "flow_7d_avg", "flow_lag7"])
+        df = df.dropna(subset=["target", "flow_7d_avg", "flow_lag7", "flow_lag30"])
 
         # Drop the raw flow_cfs from features to avoid target leakage
         # (lagged versions are fine as predictors)
@@ -168,7 +174,7 @@ class FlowPredictor:
             self.pipeline.fit(X_tr, y_tr)
             preds = self.pipeline.predict(X_val)
             cv_mae.append(mean_absolute_error(y_val, preds))
-            cv_rmse.append(mean_squared_error(y_val, preds, squared=False))
+            cv_rmse.append(root_mean_squared_error(y_val, preds))
             cv_r2.append(r2_score(y_val, preds))
 
         # Final fit on all data

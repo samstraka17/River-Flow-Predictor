@@ -27,6 +27,9 @@ models/saved/
 # macOS
 .DS_Store
 
+# Scratch / temp files
+Flow
+
 # IDE
 .vscode/
 .idea/

@@ -1,28 +1,58 @@
-"""USGS NWIS daily streamflow fetcher for the upper Arkansas River basin.
+"""USGS streamflow data from the USGS Water Data OGC API.
 
-Data source: https://waterservices.usgs.gov/nwis/dv/
-Statistics API: https://api.waterdata.usgs.gov/statistics/v0/
+API docs: https://api.waterdata.usgs.gov/ogcapi/v0
+Auth:     Bearer token via API_USGS_PAT env var (optional; bypasses rate limits).
+          Register at https://api.waterdata.usgs.gov/signup/
 """
 
-import requests
-import pandas as pd
+import os
 from datetime import date
 from typing import Optional
 
-# Key gauges in the upper Arkansas River basin, ordered upstream → downstream
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0"
+_PAGE_SIZE = 10_000
+
+# Gauges used in the upper Arkansas River basin
 ARKANSAS_GAUGES: dict[str, str] = {
-    "07086000": "Arkansas River at Leadville, CO",
-    "07091200": "Arkansas River at Granite, CO",
-    "07096000": "Arkansas River at Parkdale, CO",
-    "07099970": "Arkansas River near Avondale, CO",
+    "07083710": "Arkansas River Below Empire Gulch near Malta, CO",
+    "07091200": "Arkansas River near Nathrop, CO",
 }
 
-# Default primary gauge (Granite sits above most major tributaries)
 DEFAULT_GAUGE = "07091200"
 
-_NWIS_URL = "https://waterservices.usgs.gov/nwis/dv/"
-_DISCHARGE_CD = "00060"  # mean daily discharge, cfs
-_MEAN_STAT = "00003"     # statistical code for daily mean
+
+def _headers() -> dict[str, str]:
+    token = os.getenv("API_USGS_PAT")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def _get_all_pages(url: str, params: dict) -> list[dict]:
+    """Fetch all pages from an OGC API endpoint and return the combined feature list."""
+    features: list[dict] = []
+    params = {**params, "limit": _PAGE_SIZE, "offset": 0}
+
+    while True:
+        resp = requests.get(url, params=params, headers=_headers(), timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        page_features = payload.get("features", [])
+        features.extend(page_features)
+
+        if len(page_features) < _PAGE_SIZE:
+            break
+
+        params["offset"] += _PAGE_SIZE
+
+    return features
 
 
 def fetch_flow(
@@ -30,7 +60,7 @@ def fetch_flow(
     start_date: str = "1990-01-01",
     end_date: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Fetch daily mean discharge (cfs) from a single USGS gauge.
+    """Fetch daily mean discharge (cfs) from the USGS Water Data OGC API.
 
     Parameters
     ----------
@@ -41,86 +71,70 @@ def fetch_flow(
     Returns
     -------
     DataFrame indexed by date with columns [site_no, discharge_cfs].
-    Rows with sentinel/negative values are removed.
     """
-    if end_date is None:
-        end_date = date.today().isoformat()
-
+    end = end_date or date.today().isoformat()
     params = {
-        "format": "json",
-        "sites": site_no,
-        "startDT": start_date,
-        "endDT": end_date,
-        "parameterCd": _DISCHARGE_CD,
-        "statCd": _MEAN_STAT,
+        "monitoring_location_id": f"USGS-{site_no}",
+        "parameter_code": "00060",   # discharge
+        "statistic_id": "00003",     # mean
+        "datetime": f"{start_date}/{end}",
+        "f": "json",
     }
 
-    resp = requests.get(_NWIS_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
+    features = _get_all_pages(f"{_BASE}/collections/daily/items", params)
 
-    time_series = payload.get("value", {}).get("timeSeries", [])
-    if not time_series:
-        raise ValueError(
-            f"No discharge data returned for site {site_no} "
-            f"({start_date} – {end_date})."
+    if not features:
+        raise RuntimeError(
+            f"No daily discharge data returned for site {site_no} "
+            f"({start_date} – {end})."
         )
 
-    raw_values = time_series[0]["values"][0]["value"]
-
-    records = []
-    for entry in raw_values:
-        try:
-            cfs = float(entry["value"])
-        except (ValueError, TypeError):
-            cfs = float("nan")
-        records.append({"date": entry["dateTime"][:10], "discharge_cfs": cfs})
+    _SENTINEL = {"", None, "Ice", "Ssn", "Bkw", "Eqp", "Rat", "***"}
+    records = [
+        {
+            "date": feat["properties"]["time"],
+            "discharge_cfs": feat["properties"]["value"],
+            "site_no": site_no,
+        }
+        for feat in features
+        if feat.get("properties", {}).get("value") not in _SENTINEL
+    ]
 
     df = pd.DataFrame(records)
     df["date"] = pd.to_datetime(df["date"])
-    df["site_no"] = site_no
-    df = df.set_index("date").sort_index()
-
-    # Drop USGS sentinel values (e.g. -999999) and physically impossible negatives
+    df["discharge_cfs"] = pd.to_numeric(df["discharge_cfs"], errors="coerce")
+    df = df.dropna(subset=["discharge_cfs"])
     df = df[df["discharge_cfs"] >= 0]
 
-    return df[["site_no", "discharge_cfs"]]
+    return df.set_index("date").sort_index()[["site_no", "discharge_cfs"]]
 
 
-def fetch_multiple_gauges(
-    site_nos: Optional[list[str]] = None,
+def fetch_doy_statistics(
+    site_no: str = "07083710",
     start_date: str = "1990-01-01",
-    end_date: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Fetch daily flow for multiple gauges and return a wide DataFrame.
+    """Compute day-of-year mean discharge statistics from the live daily API.
 
-    Each gauge becomes a column named ``flow_<site_no>``.  Missing dates
-    for a gauge are left as NaN rather than dropping the row.
+    Fetches all daily records since start_date and computes the arithmetic mean
+    discharge per calendar day (MM-DD).
 
     Parameters
     ----------
-    site_nos:   List of 8-digit USGS site numbers.  Defaults to all
-                ``ARKANSAS_GAUGES``.
-    start_date: ISO date string, inclusive.
-    end_date:   ISO date string, inclusive (defaults to today).
+    site_no:    8-digit USGS site number.
+    start_date: Earliest record to include in the averages.
 
     Returns
     -------
-    Wide DataFrame indexed by date, columns = [flow_<site_no>, ...].
+    DataFrame indexed by 'MM-DD' day-of-year strings with columns
+    [discharge_cfs, sample_count].
     """
-    if site_nos is None:
-        site_nos = list(ARKANSAS_GAUGES.keys())
+    df = fetch_flow(site_no=site_no, start_date=start_date)
 
-    frames: list[pd.DataFrame] = []
-    for site in site_nos:
-        try:
-            df = fetch_flow(site, start_date, end_date)
-            df = df[["discharge_cfs"]].rename(columns={"discharge_cfs": f"flow_{site}"})
-            frames.append(df)
-        except Exception as exc:
-            print(f"[usgs] Warning – skipping site {site}: {exc}")
-
-    if not frames:
-        raise RuntimeError("No USGS gauge data could be retrieved.")
-
-    return pd.concat(frames, axis=1).sort_index()
+    df["day_of_year"] = df.index.strftime("%m-%d")
+    stats = (
+        df.groupby("day_of_year")["discharge_cfs"]
+        .agg(discharge_cfs="mean", sample_count="count")
+        .reset_index()
+        .set_index("day_of_year")
+    )
+    return stats
